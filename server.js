@@ -54,8 +54,80 @@ console.log("🚀 WebSocket server running on ws://localhost:8080");
 
 wss.on("connection", (socket) => {
   console.log("✅ Client connected");
+
   let bufferChunks = [];
-  let lastSendTime = Date.now();
+  let lastAudioTime = Date.now();
+  let processing = false;
+
+  const SILENCE_TIMEOUT = 1500; // 1.5 seconds of no audio
+
+  const processAudio = async () => {
+    if (processing || bufferChunks.length === 0) return;
+    processing = true;
+
+    const pcmBuffer = Buffer.concat(bufferChunks);
+    bufferChunks = [];
+
+    try {
+      const wavBuffer = await pcmToWavBuffer(pcmBuffer);
+      const wavFile = new File([wavBuffer], "audio.wav", { type: "audio/wav" });
+
+      // Transcribe
+      const sttResp = await openai.audio.transcriptions.create({
+        file: wavFile,
+        model: "gpt-4o-transcribe",
+      });
+      const callerText = sttResp.text.trim();
+
+      // Skip empty/garbage transcription
+      if (!callerText || callerText.length < 2) {
+        processing = false;
+        return;
+      }
+
+      console.log("👤 Caller:", callerText);
+
+      // ChatGPT response (English only)
+      const gptResp = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a helpful assistant. Always respond in English only.",
+          },
+          { role: "user", content: callerText },
+        ],
+      });
+      const aiText = gptResp.choices[0].message.content;
+      console.log("🤖 AI Response:", aiText);
+
+      // TTS (WAV)
+      const ttsResp = await openai.audio.speech.create({
+        model: "gpt-4o-mini-tts",
+        voice: "alloy",
+        input: aiText,
+        format: "wav",
+      });
+      const ttsWavBuffer = Buffer.from(await ttsResp.arrayBuffer());
+
+      // Convert WAV → μ-law 8kHz
+      const mulawBuffer = await wavBufferToMulaw(ttsWavBuffer);
+
+      // Send audio back
+      socket.send(
+        JSON.stringify({
+          event: "media",
+          streamSid: Date.now().toString(), // unique id for this chunk
+          media: { payload: mulawBuffer.toString("base64") },
+        })
+      );
+    } catch (err) {
+      console.error("❌ Error processing audio:", err);
+    }
+
+    processing = false;
+  };
 
   socket.on("message", async (rawData) => {
     let data;
@@ -69,71 +141,19 @@ wss.on("connection", (socket) => {
     if (data.event === "media") {
       const chunk = Buffer.from(data.media.payload, "base64");
       bufferChunks.push(chunk);
-
-      const elapsed = Date.now() - lastSendTime;
-      if (elapsed > 3000) {
-        const pcmBuffer = Buffer.concat(bufferChunks);
-        bufferChunks = [];
-        lastSendTime = Date.now();
-
-        try {
-          // Wrap PCM → WAV
-          const wavBuffer = await pcmToWavBuffer(pcmBuffer);
-          const wavFile = new File([wavBuffer], "audio.wav", {
-            type: "audio/wav",
-          });
-
-          // 1️⃣ Transcribe with Whisper
-          const sttResp = await openai.audio.transcriptions.create({
-            file: wavFile,
-            model: "gpt-4o-transcribe",
-          });
-          const callerText = sttResp.text.trim();
-          console.log("👤 Caller:", callerText);
-
-          if (callerText) {
-            // 2️⃣ ChatGPT response (English only)
-            const gptResp = await openai.chat.completions.create({
-              model: "gpt-3.5-turbo",
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "You are a helpful assistant. Always respond in English only.",
-                },
-                { role: "user", content: callerText },
-              ],
-            });
-            const aiText = gptResp.choices[0].message.content;
-            console.log("🤖 AI Response:", aiText);
-
-            // 3️⃣ TTS (WAV)
-            const ttsResp = await openai.audio.speech.create({
-              model: "gpt-4o-mini-tts",
-              voice: "alloy",
-              input: aiText,
-              format: "wav",
-            });
-            const ttsWavBuffer = Buffer.from(await ttsResp.arrayBuffer());
-
-            // 4️⃣ Convert WAV → μ-law 8kHz
-            const mulawBuffer = await wavBufferToMulaw(ttsWavBuffer);
-
-            // 5️⃣ Send audio back to Exotel
-            socket.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: data.streamSid,
-                media: { payload: mulawBuffer.toString("base64") },
-              })
-            );
-          }
-        } catch (err) {
-          console.error("❌ Error processing audio:", err);
-        }
-      }
+      lastAudioTime = Date.now();
     }
   });
 
-  socket.on("close", () => console.log("❌ Client disconnected"));
+  // Silence detection loop
+  const interval = setInterval(() => {
+    if (Date.now() - lastAudioTime > SILENCE_TIMEOUT) {
+      processAudio();
+    }
+  }, 200);
+
+  socket.on("close", () => {
+    console.log("❌ Client disconnected");
+    clearInterval(interval);
+  });
 });
