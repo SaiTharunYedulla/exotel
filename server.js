@@ -1,57 +1,14 @@
 // server.js
 import { WebSocketServer } from "ws";
-import wav from "wav";
-import { File } from "node:buffer";
 import OpenAI from "openai";
 import { Buffer } from "node:buffer";
+import { File } from "node:buffer";
+import wavDecoder from "audio-decode";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// PCM → WAV converter
-async function pcmToWavBuffer(pcmBuffer) {
-  return new Promise((resolve, reject) => {
-    const writer = new wav.Writer({
-      sampleRate: 8000,
-      channels: 1,
-      bitDepth: 16,
-    });
-
-    const chunks = [];
-    writer.on("data", (chunk) => chunks.push(chunk));
-    writer.on("finish", () => resolve(Buffer.concat(chunks)));
-    writer.on("error", reject);
-
-    writer.write(pcmBuffer);
-    writer.end();
-  });
-}
-
-// WAV → μ-law (8kHz) converter in pure Node.js
-function wavToMulawBuffer(wavBuffer) {
-  const reader = new wav.Reader();
-  const chunks = [];
-
-  return new Promise((resolve, reject) => {
-    reader.on("format", (format) => {
-      reader.on("data", (chunk) => {
-        for (let i = 0; i < chunk.length; i += 2) {
-          const sample = chunk.readInt16LE(i);
-          // μ-law companding
-          const mulawByte = linearToMuLaw(sample);
-          chunks.push(mulawByte);
-        }
-      });
-
-      reader.on("end", () => resolve(Buffer.from(chunks)));
-    });
-
-    reader.on("error", reject);
-    reader.end(wavBuffer);
-  });
-}
-
-// Linear PCM → μ-law formula
-function linearToMuLaw(sample) {
+// Convert PCM16 buffer to μ-law
+function pcm16ToMulaw(sample) {
   const MU = 255;
   const MAX = 32768;
   let sign = (sample >> 8) & 0x80;
@@ -59,6 +16,24 @@ function linearToMuLaw(sample) {
   if (sample > MAX) sample = MAX;
   const magnitude = Math.log1p((MU * sample) / MAX) / Math.log1p(MU);
   return ~(sign | Math.floor(magnitude * 127)) & 0xff;
+}
+
+// WAV buffer → μ-law 8kHz buffer
+async function wavBufferToMulaw(wavBuffer) {
+  // Decode WAV using audio-decode
+  const audioBuffer = await wavDecoder(wavBuffer);
+
+  // Take the first channel
+  const channelData = audioBuffer.getChannelData(0);
+
+  // Convert float32 [-1,1] → PCM16 → μ-law
+  const mulawBytes = Buffer.alloc(channelData.length);
+  for (let i = 0; i < channelData.length; i++) {
+    let pcm16 = Math.max(-1, Math.min(1, channelData[i])) * 32767;
+    mulawBytes[i] = pcm16ToMulaw(pcm16);
+  }
+
+  return mulawBytes;
 }
 
 // WebSocket server
@@ -90,8 +65,8 @@ wss.on("connection", (socket) => {
         lastSendTime = Date.now();
 
         try {
-          const wavBuffer = await pcmToWavBuffer(pcmBuffer);
-          const wavFile = new File([wavBuffer], "audio.wav", {
+          // Wrap PCM as WAV for Whisper
+          const wavFile = new File([pcmBuffer], "audio.wav", {
             type: "audio/wav",
           });
 
@@ -126,13 +101,13 @@ wss.on("connection", (socket) => {
               model: "gpt-4o-mini-tts",
               voice: "alloy",
               input: aiText,
-              format: "wav",
+              format: "wav", // get WAV from OpenAI
             });
 
             const ttsWavBuffer = Buffer.from(await ttsResp.arrayBuffer());
 
-            // 4️⃣ Convert WAV → μ-law
-            const mulawBuffer = await wavToMulawBuffer(ttsWavBuffer);
+            // 4️⃣ Convert WAV → μ-law 8kHz
+            const mulawBuffer = await wavBufferToMulaw(ttsWavBuffer);
 
             // 5️⃣ Send back to Exotel
             socket.send(
