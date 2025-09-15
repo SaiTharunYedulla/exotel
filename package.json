@@ -10,7 +10,9 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "audio-decode": "^2.2.3",
     "openai": "^5.20.2",
+    "wav": "^1.0.2",
     "ws": "^8.18.3"
   }
 }
