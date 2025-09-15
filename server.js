@@ -1,13 +1,14 @@
 // server.js
 import { WebSocketServer } from "ws";
+import wav from "wav";
+import { File } from "node:buffer";
 import OpenAI from "openai";
 import { Buffer } from "node:buffer";
-import { File } from "node:buffer";
 import wavDecoder from "audio-decode";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Convert PCM16 buffer to μ-law
+// PCM16 → μ-law conversion
 function pcm16ToMulaw(sample) {
   const MU = 255;
   const MAX = 32768;
@@ -20,20 +21,31 @@ function pcm16ToMulaw(sample) {
 
 // WAV buffer → μ-law 8kHz buffer
 async function wavBufferToMulaw(wavBuffer) {
-  // Decode WAV using audio-decode
   const audioBuffer = await wavDecoder(wavBuffer);
-
-  // Take the first channel
   const channelData = audioBuffer.getChannelData(0);
-
-  // Convert float32 [-1,1] → PCM16 → μ-law
   const mulawBytes = Buffer.alloc(channelData.length);
   for (let i = 0; i < channelData.length; i++) {
     let pcm16 = Math.max(-1, Math.min(1, channelData[i])) * 32767;
     mulawBytes[i] = pcm16ToMulaw(pcm16);
   }
-
   return mulawBytes;
+}
+
+// PCM buffer → WAV buffer
+async function pcmToWavBuffer(pcmBuffer) {
+  return new Promise((resolve, reject) => {
+    const writer = new wav.Writer({
+      sampleRate: 8000,
+      channels: 1,
+      bitDepth: 16,
+    });
+    const chunks = [];
+    writer.on("data", (chunk) => chunks.push(chunk));
+    writer.on("finish", () => resolve(Buffer.concat(chunks)));
+    writer.on("error", reject);
+    writer.write(pcmBuffer);
+    writer.end();
+  });
 }
 
 // WebSocket server
@@ -65,8 +77,9 @@ wss.on("connection", (socket) => {
         lastSendTime = Date.now();
 
         try {
-          // Wrap PCM as WAV for Whisper
-          const wavFile = new File([pcmBuffer], "audio.wav", {
+          // Wrap PCM → WAV
+          const wavBuffer = await pcmToWavBuffer(pcmBuffer);
+          const wavFile = new File([wavBuffer], "audio.wav", {
             type: "audio/wav",
           });
 
@@ -75,7 +88,6 @@ wss.on("connection", (socket) => {
             file: wavFile,
             model: "gpt-4o-transcribe",
           });
-
           const callerText = sttResp.text.trim();
           console.log("👤 Caller:", callerText);
 
@@ -92,24 +104,22 @@ wss.on("connection", (socket) => {
                 { role: "user", content: callerText },
               ],
             });
-
             const aiText = gptResp.choices[0].message.content;
             console.log("🤖 AI Response:", aiText);
 
-            // 3️⃣ Generate TTS
+            // 3️⃣ TTS (WAV)
             const ttsResp = await openai.audio.speech.create({
               model: "gpt-4o-mini-tts",
               voice: "alloy",
               input: aiText,
-              format: "wav", // get WAV from OpenAI
+              format: "wav",
             });
-
             const ttsWavBuffer = Buffer.from(await ttsResp.arrayBuffer());
 
             // 4️⃣ Convert WAV → μ-law 8kHz
             const mulawBuffer = await wavBufferToMulaw(ttsWavBuffer);
 
-            // 5️⃣ Send back to Exotel
+            // 5️⃣ Send audio back to Exotel
             socket.send(
               JSON.stringify({
                 event: "media",
@@ -125,7 +135,5 @@ wss.on("connection", (socket) => {
     }
   });
 
-  socket.on("close", () => {
-    console.log("❌ Client disconnected");
-  });
+  socket.on("close", () => console.log("❌ Client disconnected"));
 });
