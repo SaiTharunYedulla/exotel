@@ -1,130 +1,123 @@
 import { WebSocketServer } from "ws";
-import fs from "fs";
 import { Readable } from "stream";
 import wav from "wav";
 import OpenAI from "openai";
+import { File } from "node:buffer"; // 👈 add this
+import { File } from "node:buffer";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
+// 👈 important import
 
-console.log(`✅ WebSocket server running on ws://localhost:${PORT}`);
+// inside your 3s buffer handler:
+try {
+  // Convert PCM → WAV
+  const wavBuffer = await pcmToWavBuffer(pcmBuffer);
 
-// PCM → WAV helper
-function pcmToWavBuffer(pcmBuffer, sampleRate = 8000) {
-  const writer = new wav.Writer({
-    sampleRate,
-    channels: 1,
-    bitDepth: 16,
+  // ✅ Create File object in memory
+  const wavFile = new File([wavBuffer], "audio.wav", { type: "audio/wav" });
+
+  // 1. Transcribe with Whisper
+  const sttResp = await openai.audio.transcriptions.create({
+    file: wavFile,
+    model: "gpt-4o-transcribe",
   });
 
-  const stream = new Readable();
-  stream.push(pcmBuffer);
-  stream.push(null);
+  const callerText = sttResp.text.trim();
+  console.log(`👤 Caller (${callId}):`, callerText);
 
-  const chunks = [];
-  writer.on("data", (chunk) => chunks.push(chunk));
-  stream.pipe(writer);
-
-  return new Promise((resolve) => {
-    writer.on("finish", () => {
-      resolve(Buffer.concat(chunks));
+  if (callerText) {
+    // 2. ChatGPT response
+    const gptResp = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "user", content: callerText }],
     });
-  });
+
+    const aiText = gptResp.choices[0].message.content;
+    console.log(`🤖 AI Response: ${aiText}`);
+
+    // 3. Convert response → TTS
+    const ttsResp = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice: "alloy",
+      input: aiText,
+    });
+
+    const aiAudio = Buffer.from(await ttsResp.arrayBuffer());
+    const aiBase64 = aiAudio.toString("base64");
+
+    // 4. Send back audio to Exotel
+    socket.send(
+      JSON.stringify({
+        event: "media",
+        streamSid: data.streamSid,
+        media: { payload: aiBase64 },
+      })
+    );
+  }
+} catch (err) {
+  console.error("❌ Error processing audio:", err);
 }
 
-wss.on("connection", (socket) => {
-  console.log("📞 New Exotel call connected!");
+if (data.event === "media") {
+  // base64 PCM → Buffer
+  const chunk = Buffer.from(data.media.payload, "base64");
+  bufferChunks.push(chunk);
 
-  let callId = "unknown";
-  let bufferChunks = [];
-  let lastSendTime = Date.now();
+  const elapsed = Date.now() - lastSendTime;
+  if (elapsed > 3000) {
+    // 3s worth of audio
+    const pcmBuffer = Buffer.concat(bufferChunks);
+    bufferChunks = [];
+    lastSendTime = Date.now();
 
-  socket.on("message", async (rawMsg) => {
-    let data;
     try {
-      data = JSON.parse(rawMsg.toString());
-    } catch {
-      return; // ignore bad messages
-    }
+      // Convert PCM → WAV
+      const wavBuffer = await pcmToWavBuffer(pcmBuffer);
 
-    if (data.event === "start") {
-      callId = data.start?.callSid || "unknown";
-      console.log("▶️ Call started:", callId);
-    }
+      // ✅ Wrap into a File object
+      const wavFile = new File([wavBuffer], "audio.wav", { type: "audio/wav" });
 
-    if (data.event === "media") {
-      // base64 PCM → Buffer
-      const chunk = Buffer.from(data.media.payload, "base64");
-      bufferChunks.push(chunk);
+      // 1. Transcribe with Whisper
+      const sttResp = await openai.audio.transcriptions.create({
+        file: wavFile,
+        model: "gpt-4o-transcribe",
+      });
 
-      const elapsed = Date.now() - lastSendTime;
-      if (elapsed > 3000) {
-        // 3s worth of audio
-        const pcmBuffer = Buffer.concat(bufferChunks);
-        bufferChunks = [];
-        lastSendTime = Date.now();
+      const callerText = sttResp.text.trim();
+      console.log(`👤 Caller (${callId}):`, callerText);
 
-        try {
-          // Convert PCM → WAV
-          const wavBuffer = await pcmToWavBuffer(pcmBuffer);
+      if (callerText) {
+        // 2. ChatGPT response
+        const gptResp = await openai.chat.completions.create({
+          model: "gpt-3.5-turbo",
+          messages: [{ role: "user", content: callerText }],
+        });
 
-          // 1. Transcribe with Whisper
-          const sttResp = await openai.audio.transcriptions.create({
-            file: new Readable({
-              read() {
-                this.push(wavBuffer);
-                this.push(null);
-              },
-            }),
-            model: "gpt-4o-transcribe",
-          });
+        const aiText = gptResp.choices[0].message.content;
+        console.log(`🤖 AI Response: ${aiText}`);
 
-          const callerText = sttResp.text.trim();
-          console.log(`👤 Caller (${callId}):`, callerText);
+        // 3. Convert response → TTS
+        const ttsResp = await openai.audio.speech.create({
+          model: "gpt-4o-mini-tts",
+          voice: "alloy",
+          input: aiText,
+        });
 
-          if (callerText) {
-            // 2. ChatGPT response
-            const gptResp = await openai.chat.completions.create({
-              model: "gpt-3.5-turbo",
-              messages: [{ role: "user", content: callerText }],
-            });
+        const aiAudio = Buffer.from(await ttsResp.arrayBuffer());
+        const aiBase64 = aiAudio.toString("base64");
 
-            const aiText = gptResp.choices[0].message.content;
-            console.log(`🤖 AI Response: ${aiText}`);
-
-            // 3. Convert response → TTS
-            const ttsResp = await openai.audio.speech.create({
-              model: "gpt-4o-mini-tts",
-              voice: "alloy",
-              input: aiText,
-            });
-
-            const aiAudio = Buffer.from(await ttsResp.arrayBuffer());
-            const aiBase64 = aiAudio.toString("base64");
-
-            // 4. Send back audio to Exotel
-            socket.send(
-              JSON.stringify({
-                event: "media",
-                streamSid: data.streamSid,
-                media: { payload: aiBase64 },
-              })
-            );
-          }
-        } catch (err) {
-          console.error("❌ Error processing audio:", err);
-        }
+        // 4. Send back audio to Exotel
+        socket.send(
+          JSON.stringify({
+            event: "media",
+            streamSid: data.streamSid,
+            media: { payload: aiBase64 },
+          })
+        );
       }
+    } catch (err) {
+      console.error("❌ Error processing audio:", err);
     }
-
-    if (data.event === "stop") {
-      console.log("⏹️ Call stopped:", callId);
-    }
-  });
-
-  socket.on("close", () => {
-    console.log(`☎️ Call ended: ${callId}`);
-  });
-});
+  }
+}
