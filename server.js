@@ -3,7 +3,6 @@ import { Readable } from "stream";
 import wav from "wav";
 import OpenAI from "openai";
 import { File } from "node:buffer"; // 👈 add this
-import { File } from "node:buffer";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
